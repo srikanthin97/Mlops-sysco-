@@ -1,0 +1,564 @@
+# SYSCO Supply Chain Forecasting - Complete Setup Guide
+
+## 📋 Project Structure & Files
+
+```
+sysco-supply-chain-forecasting/
+├── .github/workflows/
+│   ├── ci-pipeline.yml                  # GitHub Actions for testing
+│   ├── deploy-model.yml                 # Deployment automation
+│   └── retraining-scheduler.yml         # Weekly retraining
+├── src/
+│   ├── config/
+│   │   ├── gcp_config.py               # GCP configuration
+│   │   ├── model_config.py             # Model hyperparameters
+│   │   └── feature_config.py           # Feature definitions
+│   ├── data/
+│   │   ├── data_loader.py              # BigQuery data loading
+│   │   ├── data_validator.py           # Schema & quality validation
+│   │   └── feature_engineering.py      # Feature creation
+│   ├── models/
+│   │   ├── ensemble_model.py           # LSTM + XGBoost + Prophet
+│   │   ├── lstm_model.py               # LSTM implementation
+│   │   ├── xgb_model.py                # XGBoost implementation
+│   │   └── prophet_model.py            # Prophet implementation
+│   ├── training/
+│   │   ├── train_pipeline.py           # Training orchestration
+│   │   ├── hyperparameter_tuning.py    # HPO with Vertex AI Vizier
+│   │   └── model_evaluation.py         # Evaluation metrics
+│   ├── deployment/
+│   │   ├── model_registry.py           # Model versioning
+│   │   ├── model_serving.py            # Vertex AI deployment
+│   │   └── prediction_service.py       # Flask REST API
+│   ├── monitoring/
+│   │   ├── data_drift_detector.py      # Drift detection
+│   │   ├── model_performance_monitor.py # Performance tracking
+│   │   └── alert_manager.py            # Alert triggering
+│   ├── orchestration/
+│   │   ├── vertex_pipeline.py          # Kubeflow V2 pipeline
+│   │   └── pipeline_components.py      # Pipeline steps
+│   └── utils/
+│       ├── logging_config.py           # Logging setup
+│       ├── gcp_utils.py                # GCP helpers
+│       ├── metrics.py                  # Metric calculations
+│       └── constants.py                # Constants
+├── notebooks/
+│   ├── 01_exploratory_analysis.ipynb
+│   ├── 02_feature_engineering.ipynb
+│   ├── 03_model_development.ipynb
+│   └── 04_model_evaluation.ipynb
+├── terraform/
+│   ├── main.tf                         # Main infrastructure
+│   ├── variables.tf                    # Variables
+│   ├── outputs.tf                      # Outputs
+│   ├── vpc.tf                          # Network setup
+│   └── terraform.tfvars
+├── docker/
+│   ├── Dockerfile.training             # Training container
+│   ├── Dockerfile.serving              # Serving container
+│   └── requirements.txt                # Python dependencies
+├── tests/
+│   ├── test_data_loader.py
+│   ├── test_feature_engineering.py
+│   ├── test_models.py
+│   ├── test_evaluation.py
+│   ├── test_integration.py
+│   └── conftest.py
+├── scripts/
+│   ├── setup_project.sh                # Initial GCP setup
+│   ├── train_model.sh                  # Local training
+│   ├── deploy_model.sh                 # Deploy to prod
+│   ├── run_inference.sh                # Test inference
+│   ├── setup_monitoring.sh             # Monitoring setup
+│   ├── deploy_vertex_endpoint.py       # Vertex deployment
+│   ├── check_model_performance.py      # Performance check
+│   ├── validate_and_promote_model.py   # Model promotion
+│   └── send_performance_report.py      # Report generation
+├── config/
+│   ├── development.yaml                # Dev configuration
+│   ├── staging.yaml                    # Staging configuration
+│   ├── production.yaml                 # Prod configuration
+│   └── monitoring_config.yaml          # Monitoring setup
+├── .github/
+│   ├── CODEOWNERS
+│   └── pull_request_template.md
+├── .gitignore
+├── requirements.txt
+├── setup.py
+├── pytest.ini
+└── README.md
+```
+
+---
+
+## 🚀 Quick Start Guide
+
+### Prerequisites
+- GCP Project with billing enabled
+- `gcloud` CLI installed and configured
+- `terraform` >= 1.0
+- Python 3.9+
+- Docker installed
+- Git
+
+### Step 1: Clone Repository
+```bash
+git clone https://github.com/sysco/supply-chain-forecasting.git
+cd supply-chain-forecasting
+```
+
+### Step 2: Set Environment Variables
+```bash
+export GCP_PROJECT_ID="your-project-id"
+export GCP_REGION="us-central1"
+export ENVIRONMENT="development"
+
+gcloud config set project $GCP_PROJECT_ID
+gcloud config set compute/region $GCP_REGION
+```
+
+### Step 3: Install Dependencies
+```bash
+pip install -r requirements.txt
+```
+
+### Step 4: Run Project Setup
+```bash
+bash scripts/setup_project.sh $GCP_PROJECT_ID $GCP_REGION
+```
+
+This will:
+- Enable required GCP APIs
+- Create GCS buckets
+- Create BigQuery datasets and tables
+- Setup Artifact Registry
+- Configure service accounts
+
+### Step 5: Load Training Data
+```bash
+# Prepare your CSV files in data/ directory
+# Then upload to GCS:
+gsutil cp data/*.csv gs://sysco-forecasting-bucket-$GCP_PROJECT_ID/data/
+
+# Load into BigQuery:
+bq load --source_format=CSV \
+    --skip_leading_rows=1 \
+    supply_chain_forecasting.raw_demand \
+    gs://sysco-forecasting-bucket-$GCP_PROJECT_ID/data/demand_data.csv \
+    date:DATE,sku:STRING,distribution_center:STRING,demand:FLOAT64,price:FLOAT64,promotion_flag:INTEGER,competitor_price:FLOAT64
+```
+
+### Step 6: Deploy Infrastructure with Terraform
+```bash
+cd terraform/
+terraform init
+terraform plan
+terraform apply -var="project_id=$GCP_PROJECT_ID" -var="environment=development"
+cd ..
+```
+
+### Step 7: Run Tests
+```bash
+pytest tests/ -v --cov=src
+```
+
+### Step 8: Train Model Locally
+```bash
+python src/training/train_pipeline.py --mode=local --config=config/development.yaml
+```
+
+### Step 9: Deploy Model
+```bash
+bash scripts/deploy_model.sh
+```
+
+### Step 10: Test Inference
+```bash
+SERVICE_URL=$(gcloud run services describe sysco-forecasting-service \
+    --region=$GCP_REGION --format='value(status.url)')
+
+bash scripts/run_inference.sh $SERVICE_URL
+```
+
+---
+
+## 📊 Data Format
+
+### Raw Demand Data (raw_demand table)
+```
+date            | DATE
+sku             | STRING (e.g., "SKU001")
+distribution_center | STRING (e.g., "DC-01")
+demand          | FLOAT64 (quantity)
+price           | FLOAT64 (unit price)
+promotion_flag  | INTEGER (0 or 1)
+competitor_price| FLOAT64 (competitor's price)
+```
+
+**Sample CSV:**
+```
+2023-01-01,SKU001,DC-01,1500.50,25.99,0,26.99
+2023-01-01,SKU002,DC-01,800.25,15.50,1,16.00
+2023-01-02,SKU001,DC-01,1520.75,25.99,0,27.00
+```
+
+---
+
+## 🤖 Model Architecture
+
+### Ensemble Forecaster
+The system uses a **weighted ensemble** of three models:
+
+**1. LSTM (Long Short-Term Memory) - 40% weight**
+- Captures temporal dependencies
+- Input: Sequences of historical demand (52 weeks)
+- Architecture: 
+  - LSTM layer: 64 units
+  - Dropout: 0.2
+  - Dense layer: 16 units
+  - Output: Single prediction
+
+**2. XGBoost - 30% weight**
+- Captures non-linear relationships
+- Input: Feature-engineered data
+- Configuration:
+  - n_estimators: 100-200
+  - max_depth: 6-8
+  - learning_rate: 0.1
+
+**3. Prophet - 30% weight**
+- Handles seasonality and trends
+- Decomposes into: trend + yearly_seasonality + weekly_seasonality
+- Robust to missing data and outliers
+
+### Feature Engineering
+**Temporal Features:**
+- Year, Month, Week, Day of Week
+- Cyclical encoding (sin/cos transform)
+- Quarter, Day of Year
+
+**Lag Features:**
+- 1-week, 4-week, 13-week, 26-week, 52-week lags
+
+**Rolling Statistics:**
+- Rolling mean (4, 8, 13, 26 weeks)
+- Rolling std (4, 8, 13, 26 weeks)
+- Rolling min/max
+
+**Seasonal Features:**
+- Holiday flag (weekends)
+- Quarter start, Month start indicators
+
+---
+
+## 📈 Training Pipeline
+
+### Local Training
+```bash
+python src/training/train_pipeline.py --mode=local
+```
+
+### Vertex AI Training
+```bash
+python src/training/train_pipeline.py --mode=vertex-ai --config=config/production.yaml
+```
+
+### Steps:
+1. **Data Loading**: Query BigQuery for 2 years of historical data
+2. **Feature Engineering**: Create 50+ features
+3. **Train/Val Split**: 80/20 temporal split
+4. **Model Training**: Ensemble training (10-30 min depending on data size)
+5. **Evaluation**: Calculate MAE, RMSE, MAPE
+6. **Model Registry**: Upload to Vertex AI Model Registry
+
+**Expected Metrics:**
+- MAE: 30-50 units (development: 20-30)
+- RMSE: 40-60 units
+- MAPE: 10-15% (development: 8-12%)
+- Directional Accuracy: >80%
+
+---
+
+## 🚢 Deployment
+
+### Cloud Run Deployment
+The REST API is containerized and deployed to Cloud Run:
+
+**Endpoints:**
+- `POST /predict` - Real-time predictions
+- `POST /batch-predict` - Batch predictions
+- `GET /health` - Health check
+
+**Example Request:**
+```bash
+curl -X POST https://sysco-forecasting-service-xxxxx.run.app/predict \
+  -H "Content-Type: application/json" \
+  -d '{
+    "sku": "SKU001",
+    "distribution_center": "DC-01",
+    "features": [100, 110, 105, 120, 115, 108, 112, 118, 122, 125]
+  }'
+```
+
+**Response:**
+```json
+{
+  "status": "success",
+  "predictions": [1510.25, 1520.50, 1535.75],
+  "sku": "SKU001",
+  "distribution_center": "DC-01"
+}
+```
+
+### Vertex AI Endpoint Deployment
+Models are also deployed as Vertex AI Endpoints for:
+- Automatic scaling
+- A/B testing
+- Online feature store integration
+- Model explanations
+
+---
+
+## 📊 Monitoring & Alerting
+
+### Key Metrics Monitored
+1. **Model Performance**
+   - MAE, RMSE, MAPE
+   - Directional accuracy
+   - Forecast bias
+
+2. **Data Quality**
+   - Missing value rate
+   - Outlier detection
+   - Data drift (KS test)
+
+3. **Infrastructure**
+   - Prediction latency (<100ms target)
+   - Endpoint availability (>99.9%)
+   - Error rate (<0.1%)
+
+4. **Model Drift**
+   - Feature distribution changes
+   - Prediction output distribution
+   - Actual vs predicted trends
+
+### Alerts
+Configured in `config/monitoring_config.yaml`:
+- **WARNING**: MAPE > 20%, MAE > 50
+- **CRITICAL**: Endpoint errors > 1%, Availability < 99%
+
+Notification channels:
+- Email: ml-team@sysco.com
+- Slack: #ml-alerts
+- PagerDuty: For critical alerts
+
+---
+
+## 🔄 Retraining Pipeline
+
+### Automated Retraining
+Triggered by GitHub Actions weekly on Monday at 2 AM UTC:
+
+```yaml
+# .github/workflows/retraining-scheduler.yml
+schedule:
+  - cron: '0 2 * * 1'  # Every Monday at 2 AM
+```
+
+### Retraining Steps:
+1. Check model performance (must be within thresholds)
+2. Load latest 2 years of data
+3. Run feature engineering
+4. Train ensemble model
+5. Validate on holdout test set
+6. Compare with baseline model
+7. If better, promote to production
+8. Send performance report
+
+### Manual Retraining
+```bash
+# Trigger via GitHub Actions
+gh workflow run retraining-scheduler.yml
+
+# Or run locally
+python scripts/check_model_performance.py --endpoint=sysco-forecasting-endpoint
+python src/training/train_pipeline.py --mode=vertex-ai
+python scripts/validate_and_promote_model.py --validation-threshold=0.1
+```
+
+---
+
+## 🧪 Testing
+
+### Run All Tests
+```bash
+pytest tests/ -v --cov=src --cov-report=html
+```
+
+### Unit Tests
+```bash
+pytest tests/test_data_loader.py -v
+pytest tests/test_feature_engineering.py -v
+pytest tests/test_models.py -v
+pytest tests/test_evaluation.py -v
+```
+
+### Integration Tests
+```bash
+pytest tests/test_integration.py -v
+```
+
+### Test Coverage
+Target: >80% code coverage
+```bash
+pytest tests/ --cov=src --cov-report=term-missing
+```
+
+---
+
+## 📝 CI/CD Pipeline
+
+### GitHub Actions Workflows
+
+**1. CI Pipeline** (on PR)
+- Install dependencies
+- Run unit tests
+- Code quality checks (flake8)
+- Upload coverage to CodeCov
+
+**2. Deploy Pipeline** (on main merge)
+- Build Docker image
+- Push to Artifact Registry
+- Deploy to Cloud Run
+- Deploy to Vertex AI Endpoint
+- Run smoke tests
+
+**3. Retraining Scheduler** (weekly)
+- Check model performance
+- Trigger Vertex AI Pipeline
+- Validate and promote model
+- Send report
+
+### Required Secrets (in GitHub)
+```
+GCP_PROJECT_ID          # GCP Project ID
+GCP_REGION              # GCP Region
+WIF_PROVIDER            # Workload Identity Provider
+WIF_SERVICE_ACCOUNT     # Service Account for CI/CD
+SLACK_WEBHOOK_URL       # For notifications
+ALERT_EMAIL             # Alert recipient
+```
+
+---
+
+## 🔐 Security Best Practices
+
+1. **Service Account Isolation**
+   - Separate service accounts for training, serving, monitoring
+   - Least privilege IAM roles
+
+2. **Data Protection**
+   - BigQuery encryption at rest
+   - GCS versioning enabled
+   - Audit logging enabled
+
+3. **Model Governance**
+   - Model Registry for versioning
+   - Approval workflow for production
+   - Explainability tracking
+
+4. **Infrastructure Security**
+   - VPC for GKE (if used)
+   - Private endpoints for BigQuery
+   - Secrets Manager for API keys
+
+---
+
+## 📞 Troubleshooting
+
+### Common Issues
+
+**Issue: BigQuery quota exceeded**
+```bash
+# Check quotas
+bq show --schema --format=prettyjson sysco-forecasting.raw_demand
+
+# Reduce batch size in config
+```
+
+**Issue: Training job stuck**
+```bash
+# Monitor Vertex AI job
+gcloud ai training-jobs list --region=us-central1
+
+# View logs
+gcloud ai training-jobs describe JOB_ID --region=us-central1
+```
+
+**Issue: Predictions not working**
+```bash
+# Check Cloud Run logs
+gcloud run logs read sysco-forecasting-service
+
+# Test endpoint
+curl -X GET https://sysco-forecasting-service.run.app/health
+```
+
+**Issue: Data drift detected**
+```bash
+# Query drift logs
+bq query --use_legacy_sql=false '
+SELECT * FROM `project.supply_chain_forecasting.drift_detection_logs`
+WHERE drift_detected = true
+ORDER BY timestamp DESC
+LIMIT 10
+'
+```
+
+---
+
+## 📚 Additional Resources
+
+- [Vertex AI Documentation](https://cloud.google.com/vertex-ai/docs)
+- [BigQuery ML Guide](https://cloud.google.com/bigquery/docs/bqml-introduction)
+- [Kubeflow Pipelines](https://www.kubeflow.org/docs/pipelines/)
+- [Time Series Forecasting Best Practices](https://cloud.google.com/solutions/demand-forecasting)
+- [Prophet Documentation](https://facebook.github.io/prophet/)
+
+---
+
+## 👥 Team Roles
+
+| Role | Responsibilities |
+|------|------------------|
+| **Data Engineer** | BigQuery ETL, Dataflow pipelines, data quality |
+| **ML Engineer** | Model development, feature engineering, evaluation |
+| **MLOps Engineer** | Pipeline orchestration, deployment, monitoring |
+| **DevOps/SRE** | Infrastructure, CI/CD, security, scaling |
+
+---
+
+## 📋 Checklist for Production Deployment
+
+- [ ] All tests passing (>80% coverage)
+- [ ] Model metrics within acceptable range
+- [ ] Data validation passed
+- [ ] Terraform infrastructure deployed
+- [ ] Monitoring dashboards created
+- [ ] Alerts configured
+- [ ] Documentation complete
+- [ ] Team trained on system
+- [ ] Backup and disaster recovery plan
+- [ ] Security audit completed
+- [ ] Performance benchmarked
+- [ ] Scalability tested
+
+---
+
+## 📞 Support & Contact
+
+For issues or questions:
+1. Check GitHub Issues
+2. Review logs in Cloud Logging
+3. Contact ML Team: ml-team@sysco.com
+4. Escalate to DevOps: devops@sysco.com
