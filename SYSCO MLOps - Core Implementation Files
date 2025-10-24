@@ -1,0 +1,316 @@
+# File: src/config/gcp_config.py
+import os
+
+PROJECT_ID = os.getenv("GCP_PROJECT_ID", "sysco-mlops-project")
+REGION = os.getenv("GCP_REGION", "us-central1")
+GCS_BUCKET = os.getenv("GCS_BUCKET", "sysco-forecasting-bucket")
+BIGQUERY_DATASET = os.getenv("BQ_DATASET", "supply_chain_forecasting")
+VERTEX_AI_ENDPOINT_NAME = "sysco-forecasting-endpoint"
+MODEL_REGISTRY_BUCKET = f"{GCS_BUCKET}/models"
+TRAINING_DATA_BUCKET = f"{GCS_BUCKET}/training_data"
+ARTIFACT_REGISTRY = f"{REGION}-docker.pkg.dev/{PROJECT_ID}/sysco-forecasting"
+
+# ============================================================================
+# File: src/data/feature_engineering.py
+import pandas as pd
+import numpy as np
+from datetime import timedelta
+
+class FeatureEngineer:
+    def __init__(self, lookback_window=52):
+        self.lookback_window = lookback_window
+    
+    def create_lag_features(self, df, lags=[1, 4, 13, 26, 52]):
+        """Create lag features for demand"""
+        for lag in lags:
+            df[f'demand_lag_{lag}w'] = df['demand'].shift(lag)
+        return df
+    
+    def create_rolling_features(self, df, windows=[4, 8, 13, 26]):
+        """Create rolling statistics"""
+        for window in windows:
+            df[f'rolling_mean_{window}w'] = df['demand'].rolling(window).mean()
+            df[f'rolling_std_{window}w'] = df['demand'].rolling(window).std()
+            df[f'rolling_min_{window}w'] = df['demand'].rolling(window).min()
+            df[f'rolling_max_{window}w'] = df['demand'].rolling(window).max()
+        return df
+    
+    def create_temporal_features(self, df):
+        """Extract temporal features from date"""
+        df['date'] = pd.to_datetime(df['date'])
+        df['year'] = df['date'].dt.year
+        df['month'] = df['date'].dt.month
+        df['week'] = df['date'].dt.isocalendar().week
+        df['day_of_week'] = df['date'].dt.dayofweek
+        df['quarter'] = df['date'].dt.quarter
+        df['day_of_year'] = df['date'].dt.dayofyear
+        
+        # Cyclical encoding for month and day_of_week
+        df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
+        df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
+        df['dow_sin'] = np.sin(2 * np.pi * df['day_of_week'] / 7)
+        df['dow_cos'] = np.cos(2 * np.pi * df['day_of_week'] / 7)
+        return df
+    
+    def create_seasonal_features(self, df):
+        """Create seasonal indicators"""
+        df['is_holiday'] = df['date'].dt.day_name().isin(['Saturday', 'Sunday']).astype(int)
+        df['is_quarter_start'] = df['date'].dt.is_quarter_start.astype(int)
+        df['is_month_start'] = df['date'].dt.is_month_start.astype(int)
+        return df
+    
+    def engineer_features(self, df):
+        """Full feature engineering pipeline"""
+        df = df.sort_values('date').reset_index(drop=True)
+        df = self.create_temporal_features(df)
+        df = self.create_lag_features(df)
+        df = self.create_rolling_features(df)
+        df = self.create_seasonal_features(df)
+        df = df.dropna()
+        return df
+
+# ============================================================================
+# File: src/models/ensemble_model.py
+import tensorflow as tf
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler
+from prophet import Prophet
+import xgboost as xgb
+
+class EnsembleForecaster:
+    def __init__(self):
+        self.lstm_model = None
+        self.prophet_model = None
+        self.xgb_model = None
+        self.scaler = MinMaxScaler()
+        self.weights = {'lstm': 0.4, 'prophet': 0.3, 'xgb': 0.3}
+    
+    def build_lstm(self, sequence_length, n_features):
+        """Build LSTM model for sequence prediction"""
+        model = tf.keras.Sequential([
+            tf.keras.layers.LSTM(64, return_sequences=True, 
+                                 input_shape=(sequence_length, n_features)),
+            tf.keras.layers.Dropout(0.2),
+            tf.keras.layers.LSTM(32, return_sequences=False),
+            tf.keras.layers.Dropout(0.2),
+            tf.keras.layers.Dense(16, activation='relu'),
+            tf.keras.layers.Dense(1)
+        ])
+        model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+        return model
+    
+    def prepare_sequences(self, data, sequence_length=52):
+        """Create sequences for LSTM training"""
+        X, y = [], []
+        for i in range(len(data) - sequence_length):
+            X.append(data[i:i+sequence_length])
+            y.append(data[i+sequence_length, 0])
+        return np.array(X), np.array(y)
+    
+    def train_lstm(self, X_train, y_train, epochs=50, batch_size=32):
+        """Train LSTM component"""
+        self.lstm_model = self.build_lstm(X_train.shape[1], X_train.shape[2])
+        self.lstm_model.fit(X_train, y_train, epochs=epochs, batch_size=batch_size, 
+                           validation_split=0.2, verbose=0)
+    
+    def train_prophet(self, df, periods=13):
+        """Train Prophet component"""
+        prophet_df = df[['date', 'demand']].copy()
+        prophet_df.columns = ['ds', 'y']
+        self.prophet_model = Prophet(yearly_seasonality=True, 
+                                     weekly_seasonality=True,
+                                     daily_seasonality=False)
+        self.prophet_model.fit(prophet_df)
+        return self.prophet_model
+    
+    def train_xgb(self, X_train, y_train):
+        """Train XGBoost component"""
+        self.xgb_model = xgb.XGBRegressor(n_estimators=100, max_depth=6, 
+                                         learning_rate=0.1, random_state=42)
+        self.xgb_model.fit(X_train, y_train)
+    
+    def predict_ensemble(self, X_lstm, X_xgb, future_periods=13):
+        """Generate ensemble predictions"""
+        lstm_pred = self.lstm_model.predict(X_lstm, verbose=0)
+        xgb_pred = self.xgb_model.predict(X_xgb)
+        
+        prophet_future = self.prophet_model.make_future_dataframe(periods=future_periods)
+        prophet_pred = self.prophet_model.predict(prophet_future)['yhat'].values[-future_periods:]
+        
+        ensemble_pred = (self.weights['lstm'] * lstm_pred.flatten() +
+                        self.weights['xgb'] * xgb_pred +
+                        self.weights['prophet'] * prophet_pred)
+        return ensemble_pred
+
+# ============================================================================
+# File: src/training/train_pipeline.py
+from google.cloud import bigquery, storage
+import pandas as pd
+from src.data.feature_engineering import FeatureEngineer
+from src.models.ensemble_model import EnsembleForecaster
+from src.config.gcp_config import *
+
+class TrainingPipeline:
+    def __init__(self, project_id=PROJECT_ID, dataset_id=BIGQUERY_DATASET):
+        self.bq_client = bigquery.Client(project=project_id)
+        self.storage_client = storage.Client(project=project_id)
+        self.dataset_id = dataset_id
+        self.feature_engineer = FeatureEngineer()
+        self.model = EnsembleForecaster()
+    
+    def load_data_from_bigquery(self, query):
+        """Load data from BigQuery"""
+        df = self.bq_client.query(query).to_dataframe()
+        return df
+    
+    def execute_pipeline(self):
+        """End-to-end training pipeline"""
+        print("Step 1: Loading data...")
+        query = f"""
+        SELECT date, sku, distribution_center, demand, 
+               price, promotion_flag, competitor_price
+        FROM `{self.dataset_id}.raw_demand`
+        WHERE date >= DATE_SUB(CURRENT_DATE(), INTERVAL 2 YEAR)
+        ORDER BY date
+        """
+        df = self.load_data_from_bigquery(query)
+        
+        print("Step 2: Feature engineering...")
+        df = self.feature_engineer.engineer_features(df)
+        
+        print("Step 3: Train/validation split...")
+        train_size = int(0.8 * len(df))
+        X_train = df[:train_size].drop(['date', 'demand'], axis=1)
+        y_train = df[:train_size]['demand']
+        X_val = df[train_size:].drop(['date', 'demand'], axis=1)
+        y_val = df[train_size:]['demand']
+        
+        print("Step 4: Training ensemble model...")
+        self.model.train_lstm(X_train, y_train)
+        self.model.train_prophet(df[:train_size])
+        self.model.train_xgb(X_train, y_train)
+        
+        print("Step 5: Model evaluation...")
+        val_pred = self.model.predict_ensemble(X_val, X_val)
+        mae = np.mean(np.abs(val_pred - y_val))
+        print(f"Validation MAE: {mae:.2f}")
+        
+        print("Step 6: Save model artifacts...")
+        self.save_model_artifacts()
+        
+        return {'status': 'success', 'mae': mae}
+    
+    def save_model_artifacts(self):
+        """Save model to GCS"""
+        import joblib
+        bucket = self.storage_client.bucket(GCS_BUCKET)
+        
+        joblib.dump(self.model.lstm_model, '/tmp/lstm_model.pkl')
+        blob = bucket.blob('models/lstm_model.pkl')
+        blob.upload_from_filename('/tmp/lstm_model.pkl')
+        print(f"Model saved to gs://{GCS_BUCKET}/models/lstm_model.pkl")
+
+# ============================================================================
+# File: src/deployment/prediction_service.py
+from flask import Flask, request, jsonify
+from google.cloud import aiplatform, storage
+import numpy as np
+import joblib
+
+app = Flask(__name__)
+
+class PredictionService:
+    def __init__(self, project_id, endpoint_id, region='us-central1'):
+        aiplatform.init(project=project_id, location=region)
+        self.endpoint = aiplatform.Endpoint(endpoint_id)
+        self.storage_client = storage.Client()
+    
+    def preprocess_input(self, data):
+        """Preprocess input for prediction"""
+        return np.array(data).reshape(1, -1)
+    
+    def predict(self, instances):
+        """Get predictions from Vertex AI Endpoint"""
+        predictions = self.endpoint.predict(instances=instances)
+        return predictions.predictions
+
+service = PredictionService(PROJECT_ID, VERTEX_AI_ENDPOINT_NAME)
+
+@app.route('/predict', methods=['POST'])
+def predict():
+    """REST endpoint for predictions"""
+    data = request.get_json()
+    
+    try:
+        preprocessed = service.preprocess_input(data['features'])
+        predictions = service.predict(preprocessed.tolist())
+        
+        return jsonify({
+            'status': 'success',
+            'predictions': predictions[0].tolist() if isinstance(predictions[0], np.ndarray) else predictions[0],
+            'sku': data.get('sku'),
+            'distribution_center': data.get('distribution_center')
+        })
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 400
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check endpoint"""
+    return jsonify({'status': 'healthy'})
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8080)
+
+# ============================================================================
+# File: src/monitoring/data_drift_detector.py
+from scipy import stats
+from google.cloud import bigquery
+import pandas as pd
+
+class DataDriftDetector:
+    def __init__(self, threshold=0.05, project_id=PROJECT_ID):
+        self.threshold = threshold
+        self.bq_client = bigquery.Client(project=project_id)
+    
+    def detect_drift(self, feature_name, baseline_data, current_data):
+        """Detect data drift using Kolmogorov-Smirnov test"""
+        statistic, p_value = stats.ks_2samp(baseline_data, current_data)
+        
+        drift_detected = p_value < self.threshold
+        return {
+            'feature': feature_name,
+            'drift_detected': drift_detected,
+            'p_value': p_value,
+            'statistic': statistic,
+            'threshold': self.threshold
+        }
+    
+    def monitor_features(self, features_dict):
+        """Monitor multiple features for drift"""
+        results = []
+        for feature_name, (baseline, current) in features_dict.items():
+            drift_result = self.detect_drift(feature_name, baseline, current)
+            results.append(drift_result)
+            
+            if drift_result['drift_detected']:
+                print(f"⚠️  DRIFT DETECTED in {feature_name}: p-value={drift_result['p_value']:.4f}")
+        
+        return results
+    
+    def log_drift_to_bigquery(self, drift_results, dataset_id=BIGQUERY_DATASET):
+        """Log drift detection results to BigQuery"""
+        drift_logs = pd.DataFrame([
+            {
+                'timestamp': pd.Timestamp.now(),
+                'feature': r['feature'],
+                'drift_detected': r['drift_detected'],
+                'p_value': r['p_value']
+            }
+            for r in drift_results
+        ])
+        
+        table_id = f"{PROJECT_ID}.{dataset_id}.drift_detection_logs"
+        self.bq_client.load_table_from_dataframe(drift_logs, table_id, job_config=bigquery.LoadJobConfig(
+            write_disposition="WRITE_APPEND"
+        )).result()
