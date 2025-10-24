@@ -1,0 +1,516 @@
+# ============================================================================
+# File: .github/workflows/ci-pipeline.yml
+name: CI Pipeline
+
+on:
+  pull_request:
+    branches: [ main, develop ]
+  push:
+    branches: [ develop ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-cov
+    
+    - name: Run unit tests
+      run: pytest tests/ -v --cov=src --cov-report=xml
+    
+    - name: Run data validation tests
+      run: python -m pytest tests/test_data_loader.py -v
+    
+    - name: Code quality check
+      run: |
+        pip install flake8
+        flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics
+    
+    - name: Upload coverage reports
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.xml
+
+---
+
+# ============================================================================
+# File: .github/workflows/deploy-model.yml
+name: Deploy Model to Production
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GCP_REGION: us-central1
+  ARTIFACT_REGISTRY: us-central1-docker.pkg.dev
+  SERVICE_NAME: sysco-forecasting-service
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v1
+      with:
+        workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+        service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+    
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v1
+    
+    - name: Configure Docker authentication
+      run: |
+        gcloud auth configure-docker ${{ env.ARTIFACT_REGISTRY }}
+    
+    - name: Build Docker image
+      run: |
+        docker build -f docker/Dockerfile.serving -t ${{ env.ARTIFACT_REGISTRY }}/${{ env.GCP_PROJECT_ID }}/sysco-forecasting/serving:${{ github.sha }} .
+        docker tag ${{ env.ARTIFACT_REGISTRY }}/${{ env.GCP_PROJECT_ID }}/sysco-forecasting/serving:${{ github.sha }} ${{ env.ARTIFACT_REGISTRY }}/${{ env.GCP_PROJECT_ID }}/sysco-forecasting/serving:latest
+    
+    - name: Push Docker image
+      run: |
+        docker push ${{ env.ARTIFACT_REGISTRY }}/${{ env.GCP_PROJECT_ID }}/sysco-forecasting/serving:${{ github.sha }}
+        docker push ${{ env.ARTIFACT_REGISTRY }}/${{ env.GCP_PROJECT_ID }}/sysco-forecasting/serving:latest
+    
+    - name: Deploy to Cloud Run
+      run: |
+        gcloud run deploy ${{ env.SERVICE_NAME }} \
+          --image=${{ env.ARTIFACT_REGISTRY }}/${{ env.GCP_PROJECT_ID }}/sysco-forecasting/serving:${{ github.sha }} \
+          --region=${{ env.GCP_REGION }} \
+          --platform=managed \
+          --memory=2Gi \
+          --cpu=2 \
+          --timeout=300 \
+          --set-env-vars=GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }}
+    
+    - name: Deploy to Vertex AI Endpoint
+      run: |
+        python scripts/deploy_vertex_endpoint.py \
+          --model-path=gs://sysco-forecasting-bucket/models/ensemble_model_${{ github.sha }}.pkl \
+          --endpoint-name=sysco-forecasting-endpoint \
+          --region=${{ env.GCP_REGION }}
+    
+    - name: Run smoke tests
+      run: |
+        SERVICE_URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} --region=${{ env.GCP_REGION }} --format='value(status.url)')
+        curl -X POST $SERVICE_URL/predict \
+          -H "Content-Type: application/json" \
+          -d '{"features": [1, 2, 3, 4, 5], "sku": "SKU001"}'
+
+---
+
+# ============================================================================
+# File: .github/workflows/retraining-scheduler.yml
+name: Automated Retraining Pipeline
+
+on:
+  schedule:
+    - cron: '0 2 * * 1'  # Every Monday at 2 AM UTC
+  workflow_dispatch:
+
+env:
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GCP_REGION: us-central1
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v1
+      with:
+        workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+        service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+    
+    - name: Check model performance
+      run: |
+        python scripts/check_model_performance.py \
+          --endpoint=sysco-forecasting-endpoint \
+          --threshold=0.15
+    
+    - name: Trigger Vertex AI retraining pipeline
+      run: |
+        gcloud ai pipelines runs submit \
+          --region=${{ env.GCP_REGION }} \
+          --pipeline-root=gs://sysco-forecasting-bucket/pipeline-runs \
+          --template-path=gs://sysco-forecasting-bucket/pipelines/training_pipeline.json
+    
+    - name: Monitor training job
+      run: |
+        python scripts/monitor_training_job.py \
+          --project-id=${{ env.GCP_PROJECT_ID }} \
+          --region=${{ env.GCP_REGION }} \
+          --timeout=3600
+    
+    - name: Validate and promote model
+      run: |
+        python scripts/validate_and_promote_model.py \
+          --validation-threshold=0.1 \
+          --region=${{ env.GCP_REGION }}
+    
+    - name: Send performance report
+      if: always()
+      run: |
+        python scripts/send_performance_report.py \
+          --email=${{ secrets.ALERT_EMAIL }}
+
+---
+
+# ============================================================================
+# File: terraform/main.tf
+terraform {
+  required_version = ">= 1.0"
+  
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+  
+  backend "gcs" {
+    bucket = "sysco-terraform-state"
+    prefix = "supply-chain-forecasting"
+  }
+}
+
+provider "google" {
+  project = var.project_id
+  region  = var.region
+}
+
+# Enable required APIs
+resource "google_project_service" "required_apis" {
+  for_each = toset([
+    "bigquery.googleapis.com",
+    "dataflow.googleapis.com",
+    "aiplatform.googleapis.com",
+    "run.googleapis.com",
+    "cloudbuild.googleapis.com",
+    "containerregistry.googleapis.com",
+    "artifactregistry.googleapis.com",
+    "logging.googleapis.com",
+    "monitoring.googleapis.com"
+  ])
+  
+  service            = each.value
+  disable_on_destroy = false
+}
+
+# GCS Bucket for data and models
+resource "google_storage_bucket" "forecasting_bucket" {
+  name          = "sysco-forecasting-bucket-${var.project_id}"
+  location      = var.region
+  force_destroy = false
+  
+  versioning {
+    enabled = true
+  }
+  
+  lifecycle_rule {
+    condition {
+      num_newer_versions = 3
+      age_days           = 90
+    }
+    action {
+      type = "Delete"
+    }
+  }
+}
+
+# BigQuery Dataset
+resource "google_bigquery_dataset" "forecasting" {
+  dataset_id    = "supply_chain_forecasting"
+  friendly_name = "Supply Chain Forecasting"
+  location      = var.region
+  
+  default_table_expiration_ms = 7776000000  # 90 days
+  
+  labels = {
+    environment = var.environment
+    project     = "sysco-forecasting"
+  }
+}
+
+# BigQuery Table - Raw Demand Data
+resource "google_bigquery_table" "raw_demand" {
+  dataset_id = google_bigquery_dataset.forecasting.dataset_id
+  table_id   = "raw_demand"
+  
+  schema = jsonencode([
+    {
+      name        = "date"
+      type        = "DATE"
+      mode        = "REQUIRED"
+      description = "Date of demand record"
+    },
+    {
+      name        = "sku"
+      type        = "STRING"
+      mode        = "REQUIRED"
+      description = "Product SKU"
+    },
+    {
+      name        = "distribution_center"
+      type        = "STRING"
+      mode        = "REQUIRED"
+      description = "Distribution center code"
+    },
+    {
+      name        = "demand"
+      type        = "FLOAT64"
+      mode        = "REQUIRED"
+      description = "Demand quantity"
+    },
+    {
+      name        = "price"
+      type        = "FLOAT64"
+      mode        = "NULLABLE"
+      description = "Unit price"
+    },
+    {
+      name        = "promotion_flag"
+      type        = "INTEGER"
+      mode        = "NULLABLE"
+      description = "Whether promotion was active"
+    },
+    {
+      name        = "competitor_price"
+      type        = "FLOAT64"
+      mode        = "NULLABLE"
+      description = "Competitor price"
+    }
+  ])
+}
+
+# BigQuery Table - Model Predictions
+resource "google_bigquery_table" "model_predictions" {
+  dataset_id = google_bigquery_dataset.forecasting.dataset_id
+  table_id   = "model_predictions"
+  
+  schema = jsonencode([
+    {
+      name = "prediction_timestamp"
+      type = "TIMESTAMP"
+      mode = "REQUIRED"
+    },
+    {
+      name = "sku"
+      type = "STRING"
+      mode = "REQUIRED"
+    },
+    {
+      name = "distribution_center"
+      type = "STRING"
+      mode = "REQUIRED"
+    },
+    {
+      name = "predicted_demand"
+      type = "FLOAT64"
+      mode = "REQUIRED"
+    },
+    {
+      name = "actual_demand"
+      type = "FLOAT64"
+      mode = "NULLABLE"
+    },
+    {
+      name = "model_version"
+      type = "STRING"
+      mode = "REQUIRED"
+    }
+  ])
+}
+
+# BigQuery Table - Drift Detection Logs
+resource "google_bigquery_table" "drift_detection_logs" {
+  dataset_id = google_bigquery_dataset.forecasting.dataset_id
+  table_id   = "drift_detection_logs"
+  
+  schema = jsonencode([
+    {
+      name = "timestamp"
+      type = "TIMESTAMP"
+      mode = "REQUIRED"
+    },
+    {
+      name = "feature"
+      type = "STRING"
+      mode = "REQUIRED"
+    },
+    {
+      name = "drift_detected"
+      type = "BOOLEAN"
+      mode = "REQUIRED"
+    },
+    {
+      name = "p_value"
+      type = "FLOAT64"
+      mode = "REQUIRED"
+    }
+  ])
+}
+
+# Artifact Registry Repository
+resource "google_artifact_registry_repository" "sysco_repo" {
+  location      = var.region
+  repository_id = "sysco-forecasting"
+  description   = "Docker repository for SYSCO forecasting models"
+  format        = "DOCKER"
+}
+
+# Cloud Run Service Account
+resource "google_service_account" "cloud_run_sa" {
+  account_id   = "sysco-cloud-run-sa"
+  display_name = "SYSCO Cloud Run Service Account"
+}
+
+# Vertex AI Custom Training Service Account
+resource "google_service_account" "vertex_training_sa" {
+  account_id   = "sysco-vertex-training-sa"
+  display_name = "SYSCO Vertex AI Training Service Account"
+}
+
+# IAM Bindings
+resource "google_project_iam_member" "cloud_run_roles" {
+  for_each = toset([
+    "roles/bigquery.dataEditor",
+    "roles/storage.objectViewer",
+    "roles/aiplatform.user"
+  ])
+  
+  project = var.project_id
+  role    = each.value
+  member  = "serviceAccount:${google_service_account.cloud_run_sa.email}"
+}
+
+resource "google_project_iam_member" "vertex_training_roles" {
+  for_each = toset([
+    "roles/bigquery.dataEditor",
+    "roles/storage.admin",
+    "roles/aiplatform.user"
+  ])
+  
+  project = var.project_id
+  role    = each.value
+  member  = "serviceAccount:${google_service_account.vertex_training_sa.email}"
+}
+
+# Cloud Monitoring Alert Policy
+resource "google_monitoring_alert_policy" "model_performance" {
+  display_name = "Model Performance Degradation Alert"
+  combiner     = "OR"
+  
+  conditions {
+    display_name = "Model MAE exceeds threshold"
+    condition_threshold {
+      filter          = "resource.type = \"cloud_run_revision\" AND metric.type = \"custom.googleapis.com/model_mae\""
+      duration        = "300s"
+      comparison      = "COMPARISON_GT"
+      threshold_value = 50
+    }
+  }
+  
+  notification_channels = [google_monitoring_notification_channel.email.name]
+}
+
+# Notification Channel
+resource "google_monitoring_notification_channel" "email" {
+  display_name = "SYSCO ML Team Email"
+  type         = "email"
+  
+  labels = {
+    email_address = var.alert_email
+  }
+}
+
+---
+
+# ============================================================================
+# File: terraform/variables.tf
+variable "project_id" {
+  description = "GCP Project ID"
+  type        = string
+}
+
+variable "region" {
+  description = "GCP Region"
+  type        = string
+  default     = "us-central1"
+}
+
+variable "environment" {
+  description = "Environment name"
+  type        = string
+  validation {
+    condition     = contains(["dev", "staging", "prod"], var.environment)
+    error_message = "Environment must be dev, staging, or prod."
+  }
+}
+
+variable "alert_email" {
+  description = "Email for alerts"
+  type        = string
+}
+
+---
+
+# ============================================================================
+# File: docker/Dockerfile.serving
+FROM python:3.9-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY src/ /app/src/
+COPY config/ /app/config/
+
+# Set environment variables
+ENV PORT=8080
+ENV PYTHONUNBUFFERED=1
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import requests; requests.get('http://localhost:8080/health')"
+
+# Run application
+CMD exec gunicorn --bind :$PORT --workers 4 --timeout 0 src.deployment.prediction_service:app
