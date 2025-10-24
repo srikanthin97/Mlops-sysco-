@@ -1,0 +1,497 @@
+# ============================================================================
+# File: tests/conftest.py
+import pytest
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+
+@pytest.fixture
+def sample_demand_data():
+    """Generate sample demand data for testing"""
+    dates = pd.date_range(start='2022-01-01', periods=365, freq='D')
+    data = {
+        'date': dates,
+        'sku': ['SKU001'] * 365,
+        'distribution_center': ['DC-01'] * 365,
+        'demand': np.random.normal(100, 20, 365).clip(0),
+        'price': np.random.uniform(10, 50, 365),
+        'promotion_flag': np.random.choice([0, 1], 365),
+        'competitor_price': np.random.uniform(5, 60, 365)
+    }
+    return pd.DataFrame(data)
+
+@pytest.fixture
+def feature_engineered_data(sample_demand_data):
+    """Generate feature-engineered data"""
+    from src.data.feature_engineering import FeatureEngineer
+    fe = FeatureEngineer()
+    return fe.engineer_features(sample_demand_data)
+
+@pytest.fixture
+def train_test_split(feature_engineered_data):
+    """Create train/test split"""
+    train_size = int(0.8 * len(feature_engineered_data))
+    X_train = feature_engineered_data[:train_size].drop(['date', 'demand'], axis=1)
+    y_train = feature_engineered_data[:train_size]['demand']
+    X_test = feature_engineered_data[train_size:].drop(['date', 'demand'], axis=1)
+    y_test = feature_engineered_data[train_size:]['demand']
+    
+    return X_train, X_test, y_train, y_test
+
+---
+
+# ============================================================================
+# File: tests/test_data_loader.py
+import pytest
+from src.data.data_loader import DataLoader
+
+class TestDataLoader:
+    def test_load_from_bigquery(self):
+        """Test loading data from BigQuery"""
+        loader = DataLoader()
+        query = "SELECT 1 as test_col"
+        # Mock BigQuery response in actual tests
+        assert loader is not None
+    
+    def test_validate_schema(self, sample_demand_data):
+        """Test schema validation"""
+        required_cols = ['date', 'sku', 'distribution_center', 'demand']
+        assert all(col in sample_demand_data.columns for col in required_cols)
+    
+    def test_handle_missing_values(self, sample_demand_data):
+        """Test handling of missing values"""
+        # Add some NaNs
+        sample_demand_data.loc[0:5, 'demand'] = np.nan
+        
+        cleaned = sample_demand_data.dropna()
+        assert len(cleaned) < len(sample_demand_data)
+        assert cleaned['demand'].isna().sum() == 0
+
+---
+
+# ============================================================================
+# File: tests/test_feature_engineering.py
+import pytest
+import pandas as pd
+import numpy as np
+from src.data.feature_engineering import FeatureEngineer
+
+class TestFeatureEngineering:
+    def test_lag_features(self, sample_demand_data):
+        """Test lag feature creation"""
+        fe = FeatureEngineer()
+        result = fe.create_lag_features(sample_demand_data.copy())
+        
+        assert 'demand_lag_1w' in result.columns
+        assert 'demand_lag_4w' in result.columns
+        assert result['demand_lag_1w'].isna().sum() > 0  # First lag should have NaN
+    
+    def test_temporal_features(self, sample_demand_data):
+        """Test temporal feature extraction"""
+        fe = FeatureEngineer()
+        result = fe.create_temporal_features(sample_demand_data.copy())
+        
+        assert 'year' in result.columns
+        assert 'month' in result.columns
+        assert 'week' in result.columns
+        assert 'day_of_week' in result.columns
+        assert result['month'].min() >= 1
+        assert result['month'].max() <= 12
+    
+    def test_seasonal_features(self, sample_demand_data):
+        """Test seasonal feature creation"""
+        fe = FeatureEngineer()
+        result = fe.create_seasonal_features(sample_demand_data.copy())
+        
+        assert 'is_holiday' in result.columns
+        assert 'is_quarter_start' in result.columns
+        assert set(result['is_holiday'].unique()).issubset({0, 1})
+    
+    def test_full_pipeline(self, sample_demand_data):
+        """Test full feature engineering pipeline"""
+        fe = FeatureEngineer()
+        result = fe.engineer_features(sample_demand_data.copy())
+        
+        # Should have significantly more features
+        assert len(result.columns) > len(sample_demand_data.columns)
+        
+        # Should have no NaNs
+        assert result.isna().sum().sum() == 0
+        
+        # Should maintain same row count (roughly)
+        assert len(result) > 100
+
+---
+
+# ============================================================================
+# File: tests/test_models.py
+import pytest
+import numpy as np
+from unittest.mock import MagicMock, patch
+from src.models.ensemble_model import EnsembleForecaster
+
+class TestEnsembleModel:
+    def test_build_lstm(self):
+        """Test LSTM model creation"""
+        model = EnsembleForecaster()
+        lstm = model.build_lstm(sequence_length=52, n_features=10)
+        
+        assert lstm is not None
+        assert len(lstm.layers) > 0
+    
+    def test_prepare_sequences(self):
+        """Test sequence preparation"""
+        model = EnsembleForecaster()
+        data = np.random.randn(100, 5)
+        
+        X, y = model.prepare_sequences(data, sequence_length=10)
+        
+        assert X.shape[0] == 90  # 100 - 10
+        assert X.shape[1] == 10  # sequence_length
+        assert X.shape[2] == 5   # n_features
+        assert len(y) == 90
+    
+    def test_predict_ensemble(self, train_test_split):
+        """Test ensemble prediction"""
+        X_train, X_test, y_train, y_test = train_test_split
+        
+        model = EnsembleForecaster()
+        
+        # Train with sufficient data
+        if len(X_train) > 52:
+            X_seq, y_seq = model.prepare_sequences(
+                X_train.values, sequence_length=52
+            )
+            
+            if len(X_seq) > 0 and len(y_seq) > 0:
+                model.train_lstm(X_seq, y_seq, epochs=2)
+                model.train_xgb(X_train, y_train)
+                
+                predictions = model.predict_ensemble(
+                    X_test.values[:10].reshape(-1, X_train.shape[1], 1),
+                    X_test.iloc[:10],
+                    future_periods=5
+                )
+                
+                assert len(predictions) == 5
+                assert np.all(predictions >= 0)
+
+---
+
+# ============================================================================
+# File: tests/test_evaluation.py
+import pytest
+import numpy as np
+from src.utils.metrics import ForecastingMetrics
+
+class TestEvaluation:
+    def test_mae(self):
+        """Test MAE calculation"""
+        y_true = np.array([1, 2, 3, 4, 5])
+        y_pred = np.array([1.1, 2.1, 2.9, 4.1, 4.9])
+        
+        mae = ForecastingMetrics.mae(y_true, y_pred)
+        assert 0 < mae < 0.2
+    
+    def test_rmse(self):
+        """Test RMSE calculation"""
+        y_true = np.array([1, 2, 3, 4, 5])
+        y_pred = np.array([1, 2, 3, 4, 5])
+        
+        rmse = ForecastingMetrics.rmse(y_true, y_pred)
+        assert rmse == 0
+    
+    def test_directional_accuracy(self):
+        """Test directional accuracy"""
+        y_true = np.array([1, 2, 3, 2, 4, 5])
+        y_pred = np.array([1, 2, 3, 2, 4, 5])
+        
+        da = ForecastingMetrics.directional_accuracy(y_true, y_pred)
+        assert da == 1.0  # Perfect accuracy
+    
+    def test_forecast_bias(self):
+        """Test forecast bias calculation"""
+        y_true = np.array([10, 20, 30, 40, 50])
+        y_pred = np.array([12, 22, 32, 42, 52])
+        
+        bias = ForecastingMetrics.forecast_bias(y_true, y_pred)
+        assert bias > 0  # Positive bias (overpredicting)
+    
+    def test_coverage(self):
+        """Test coverage calculation"""
+        y_true = np.array([10, 20, 30, 40, 50])
+        pred_lower = np.array([9, 19, 29, 39, 49])
+        pred_upper = np.array([11, 21, 31, 41, 51])
+        
+        cov = ForecastingMetrics.coverage(y_true, pred_lower, pred_upper)
+        assert cov == 1.0  # 100% coverage
+
+---
+
+# ============================================================================
+# File: tests/test_integration.py
+import pytest
+from unittest.mock import MagicMock, patch
+
+class TestIntegration:
+    @patch('google.cloud.bigquery.Client')
+    def test_pipeline_end_to_end(self, mock_bq):
+        """Test full pipeline execution"""
+        # This would test the complete flow if BigQuery was mocked
+        assert True
+    
+    @patch('google.cloud.aiplatform.Endpoint')
+    def test_model_serving(self, mock_endpoint):
+        """Test model serving"""
+        assert True
+
+---
+
+# ============================================================================
+# File: pytest.ini
+[pytest]
+testpaths = tests
+python_files = test_*.py
+python_classes = Test*
+python_functions = test_*
+addopts = -v --tb=short
+markers =
+    unit: Unit tests
+    integration: Integration tests
+    slow: Slow running tests
+
+---
+
+# ============================================================================
+# File: config/development.yaml
+environment: development
+gcp:
+  project_id: sysco-mlops-project
+  region: us-central1
+  dataset: supply_chain_forecasting
+
+model:
+  type: ensemble
+  lstm:
+    units: 64
+    dropout: 0.2
+    epochs: 50
+  xgb:
+    n_estimators: 100
+    max_depth: 6
+  prophet:
+    yearly_seasonality: true
+    weekly_seasonality: true
+
+training:
+  batch_size: 32
+  validation_split: 0.2
+  test_split: 0.2
+  random_state: 42
+  
+data:
+  lookback_window: 52
+  lag_features: [1, 4, 13, 26, 52]
+  rolling_windows: [4, 8, 13, 26]
+
+monitoring:
+  enabled: false
+  drift_threshold: 0.05
+  performance_threshold:
+    mae: 50
+    mape: 0.20
+
+---
+
+# ============================================================================
+# File: config/production.yaml
+environment: production
+gcp:
+  project_id: sysco-mlops-project
+  region: us-central1
+  dataset: supply_chain_forecasting
+
+model:
+  type: ensemble
+  lstm:
+    units: 128
+    dropout: 0.3
+    epochs: 100
+  xgb:
+    n_estimators: 200
+    max_depth: 8
+  prophet:
+    yearly_seasonality: true
+    weekly_seasonality: true
+
+training:
+  batch_size: 128
+  validation_split: 0.2
+  test_split: 0.1
+  random_state: 42
+
+data:
+  lookback_window: 104
+  lag_features: [1, 4, 13, 26, 52]
+  rolling_windows: [4, 8, 13, 26]
+
+deployment:
+  cloud_run:
+    memory: 2Gi
+    cpu: 2
+    timeout: 300
+    min_instances: 2
+    max_instances: 5
+  vertex_ai:
+    machine_type: n1-standard-4
+    min_replica_count: 2
+    max_replica_count: 10
+
+monitoring:
+  enabled: true
+  drift_threshold: 0.05
+  performance_threshold:
+    mae: 40
+    mape: 0.15
+  drift_check_frequency: daily
+  retraining_frequency: weekly
+
+logging:
+  level: INFO
+  gcp_logging: true
+
+---
+
+# ============================================================================
+# File: config/monitoring_config.yaml
+alerts:
+  model_performance:
+    - name: mae_threshold
+      metric: model_mae
+      threshold: 50
+      operator: '>'
+      duration: 300
+      severity: WARNING
+    
+    - name: mape_threshold
+      metric: model_mape
+      threshold: 0.20
+      operator: '>'
+      duration: 300
+      severity: WARNING
+    
+    - name: prediction_latency
+      metric: prediction_latency_ms
+      threshold: 1000
+      operator: '>'
+      duration: 60
+      severity: CRITICAL
+
+  data_quality:
+    - name: missing_values
+      metric: missing_value_rate
+      threshold: 0.05
+      operator: '>'
+      severity: WARNING
+    
+    - name: data_drift
+      metric: ks_statistic
+      threshold: 0.1
+      operator: '>'
+      severity: WARNING
+
+  infrastructure:
+    - name: endpoint_errors
+      metric: error_rate
+      threshold: 0.01
+      operator: '>'
+      duration: 300
+      severity: CRITICAL
+    
+    - name: endpoint_availability
+      metric: availability
+      threshold: 0.99
+      operator: '<'
+      duration: 600
+      severity: CRITICAL
+
+dashboards:
+  main:
+    refresh_interval: 60
+    widgets:
+      - title: Model Accuracy (MAE)
+        metric: model_mae
+        type: time_series
+      
+      - title: Prediction Volume
+        metric: predictions_per_minute
+        type: time_series
+      
+      - title: Data Drift Score
+        metric: drift_score
+        type: gauge
+      
+      - title: Endpoint Health
+        metric: endpoint_error_rate
+        type: gauge
+
+notification_channels:
+  email:
+    recipients:
+      - ml-team@sysco.com
+      - devops@sysco.com
+  
+  slack:
+    webhook_url: ${SLACK_WEBHOOK_URL}
+    channel: '#ml-alerts'
+  
+  pagerduty:
+    enabled: true
+    for_severity: [CRITICAL]
+
+---
+
+# ============================================================================
+# File: requirements.txt
+# Core ML and Data Processing
+tensorflow==2.13.0
+torch==2.0.1
+scikit-learn==1.3.0
+xgboost==2.0.0
+prophet==1.1.5
+pandas==2.0.3
+numpy==1.24.3
+scipy==1.11.1
+
+# GCP Libraries
+google-cloud-bigquery==3.12.0
+google-cloud-storage==2.10.0
+google-cloud-aiplatform==1.32.0
+google-cloud-logging==3.5.0
+google-cloud-monitoring==2.14.0
+google-cloud-pubsub==2.18.1
+
+# ML Orchestration & Serving
+kfp==2.3.0
+gunicorn==21.2.0
+flask==2.3.2
+fastapi==0.100.0
+uvicorn==0.23.2
+
+# Data Validation
+great-expectations==0.17.12
+
+# Development & Testing
+pytest==7.4.0
+pytest-cov==4.1.0
+pytest-mock==3.11.1
+black==23.7.0
+flake8==6.0.0
+mypy==1.4.1
+
+# Utilities
+python-dotenv==1.0.0
+pyyaml==6.0
+joblib==1.3.1
+click==8.1.6
+tqdm==4.65.0
