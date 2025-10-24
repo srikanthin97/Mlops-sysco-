@@ -1,0 +1,55 @@
+# SYSCO Supply Chain Forecasting - Complete Setup Guide
+
+## 📋 Project Structure & Files
+
+```
+sysco-supply-chain-forecasting/
+├── .github/workflows/
+│   ├── ci-pipeline.yml                  # GitHub Actions for testing
+│   ├── deploy-model.yml                 # Deployment automation
+│   └── retraining-scheduler.yml         # Weekly retraining
+├── src/
+│   ├── config/
+│   │   ├── gcp_config.py               # GCP configuration
+│   │   ├── model_config.py             # Model hyperparameters
+│   │   └── feature_config.py           # Feature definitions
+│   ├── data/
+│   │   ├── data_loader.py              # BigQuery data loading
+│   │   ├── data_validator.py           # Schema & quality validation
+│   │   └── feature_engineering.py      # Feature creation
+│   ├── models/
+│   │   ├── ensemble_model.py           # LSTM + XGBoost + Prophet
+│   │   ├── lstm_model.py               # LSTM implementation
+│   │   ├── xgb_model.py                # XGBoost implementation
+│   │   └── prophet_model.py            # Prophet implementation
+│   ├── training/
+│   │   ├── train_pipeline.py           # Training orchestration
+│   │   ├── hyperparameter_tuning.py    # HPO with Vertex AI Vizier
+│   │   └── model_evaluation.py         # Evaluation metrics
+│   ├── deployment/
+│   │   ├── model_registry.py           # Model versioning
+│   │   ├── model_serving.py            # Vertex AI deployment
+│   │   └── prediction_service.py       # Flask REST API
+│   ├── monitoring/
+│   │   ├── data_drift_detector.py      # Drift detection
+│   │   ├── model_performance_monitor.py # Performance tracking
+│   │   └── alert_manager.py            # Alert triggering
+│   ├── orchestration/
+│   │   ├── vertex_pipeline.py          # Kubeflow V2 pipeline
+│   │   └── pipeline_components.py      # Pipeline steps
+│   └── utils/
+│       ├── logging_config.py           # Logging setup
+│       ├── gcp_utils.py                # GCP helpers
+│       ├── metrics.py                  # Metric calculations
+│       └── constants.py                # Constants
+├── notebooks/
+│   ├── 01_exploratory_analysis.ipynb
+│   ├── 02_feature_engineering.ipynb
+│   ├── 03_model_development.ipynb
+│   └── 04_model_evaluation.ipynb
+├── terraform/
+│   ├── main.tf                         # Main infrastructure
+│   ├── variables.tf                    # Variables
+│   ├── outputs.tf                      # Outputs
+│   ├── vpc.tf                          # Network setup
+│   └── terraform.tfvars
