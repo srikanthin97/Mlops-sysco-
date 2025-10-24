@@ -1,0 +1,469 @@
+# SYSCO Supply Chain Forecasting - End-to-End MLOps Project
+
+## Project Overview
+This is a production-ready MLOps project for SYSCO to optimize supply chain demand forecasting using GCP Vertex AI. The project predicts weekly/monthly demand for food items across distribution centers, enabling inventory optimization and reducing stockouts.
+
+**Business Impact:** 20-50% reduction in forecasting errors, optimized inventory levels, improved service delivery.
+
+---
+
+## Architecture Overview
+
+```
+Data Sources → Data Ingestion → Data Preparation → Model Training → Model Evaluation 
+    ↓
+BigQuery/GCS → Dataflow → BigQuery ML/Vertex AI → Cloud Storage → Vertex AI Monitoring
+    ↓
+Model Deployment (Vertex AI Prediction) → Cloud Run APIs → Real-time Inference → Retraining Pipeline
+```
+
+---
+
+## Project Directory Structure
+
+```
+sysco-supply-chain-forecasting/
+│
+├── .github/
+│   └── workflows/
+│       ├── ci-pipeline.yml
+│       ├── deploy-model.yml
+│       └── retraining-scheduler.yml
+│
+├── docs/
+│   ├── README.md
+│   ├── SETUP.md
+│   ├── API_DOCUMENTATION.md
+│   └── ARCHITECTURE.md
+│
+├── src/
+│   ├── __init__.py
+│   ├── config/
+│   │   ├── __init__.py
+│   │   ├── gcp_config.py
+│   │   ├── model_config.py
+│   │   └── feature_config.py
+│   │
+│   ├── data/
+│   │   ├── __init__.py
+│   │   ├── data_loader.py
+│   │   ├── data_validator.py
+│   │   └── feature_engineering.py
+│   │
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── forecasting_model.py
+│   │   ├── prophet_model.py
+│   │   ├── lstm_model.py
+│   │   └── ensemble_model.py
+│   │
+│   ├── training/
+│   │   ├── __init__.py
+│   │   ├── train_pipeline.py
+│   │   ├── hyperparameter_tuning.py
+│   │   └── model_evaluation.py
+│   │
+│   ├── deployment/
+│   │   ├── __init__.py
+│   │   ├── model_registry.py
+│   │   ├── model_serving.py
+│   │   └── prediction_service.py
+│   │
+│   ├── monitoring/
+│   │   ├── __init__.py
+│   │   ├── data_drift_detector.py
+│   │   ├── model_performance_monitor.py
+│   │   └── alert_manager.py
+│   │
+│   ├── orchestration/
+│   │   ├── __init__.py
+│   │   ├── vertex_pipeline.py
+│   │   └── pipeline_components.py
+│   │
+│   └── utils/
+│       ├── __init__.py
+│       ├── logging_config.py
+│       ├── gcp_utils.py
+│       ├── metrics.py
+│       └── constants.py
+│
+├── notebooks/
+│   ├── 01_exploratory_analysis.ipynb
+│   ├── 02_feature_engineering.ipynb
+│   ├── 03_model_development.ipynb
+│   └── 04_model_evaluation.ipynb
+│
+├── terraform/
+│   ├── main.tf
+│   ├── variables.tf
+│   ├── outputs.tf
+│   ├── vpc.tf
+│   └── terraform.tfvars
+│
+├── docker/
+│   ├── Dockerfile.training
+│   ├── Dockerfile.serving
+│   └── requirements.txt
+│
+├── tests/
+│   ├── __init__.py
+│   ├── test_data_loader.py
+│   ├── test_feature_engineering.py
+│   ├── test_models.py
+│   ├── test_evaluation.py
+│   └── conftest.py
+│
+├── scripts/
+│   ├── setup_project.sh
+│   ├── train_model.sh
+│   ├── deploy_model.sh
+│   ├── run_inference.sh
+│   └── setup_monitoring.sh
+│
+├── config/
+│   ├── development.yaml
+│   ├── staging.yaml
+│   ├── production.yaml
+│   └── monitoring_config.yaml
+│
+├── requirements.txt
+├── setup.py
+├── pytest.ini
+├── .gitignore
+└── README.md
+```
+
+---
+
+## Phase 1: Data Acquisition & Preparation
+
+### 1.1 Data Loader (`src/data/data_loader.py`)
+Ingests data from multiple sources (BigQuery, GCS, APIs) and validates schema.
+
+### 1.2 Data Validator (`src/data/data_validator.py`)
+Checks data quality, missing values, and outliers.
+
+### 1.3 Feature Engineering (`src/data/feature_engineering.py`)
+Creates time-series features: lag features, rolling averages, seasonal indicators, external factors.
+
+**Key Features:**
+- Lag features: demand_lag_1w, demand_lag_4w
+- Rolling statistics: rolling_mean_7d, rolling_std_7d
+- Seasonal: day_of_week, week_of_year, holiday_flag
+- External: weather_data, promotions, competitor_info
+
+---
+
+## Phase 2: Model Training
+
+### 2.1 Model Architecture (`src/models/`)
+
+**Ensemble Approach:**
+- **LSTM Network:** Captures temporal dependencies in demand patterns
+- **Prophet:** Handles seasonality and trend decomposition
+- **XGBoost:** Captures complex non-linear relationships
+- **Ensemble:** Weighted average of predictions
+
+### 2.2 Training Pipeline (`src/training/train_pipeline.py`)
+- Hyperparameter tuning using Vertex AI Hyperband
+- Cross-validation with time-series splits
+- Model versioning in GCS and Vertex AI Model Registry
+
+### 2.3 Evaluation Metrics
+- MAE, RMSE, MAPE for accuracy
+- Forecast bias, coverage for business metrics
+- Directional accuracy
+
+---
+
+## Phase 3: Model Deployment
+
+### 3.1 Vertex AI Deployment
+- Deploy trained model to Vertex AI Endpoint
+- Automatic scaling based on traffic
+- A/B testing capabilities
+
+### 3.2 Cloud Run Service
+- REST API for real-time predictions
+- Batch prediction for scheduled forecasts
+- Request logging and tracing
+
+### 3.3 Model Registry
+- Version control for all models
+- Metadata tracking (performance, features, training date)
+- Model approval workflow
+
+---
+
+## Phase 4: Monitoring & Retraining
+
+### 4.1 Data Drift Detection
+- Monitor feature distributions
+- Alert if drift exceeds threshold
+
+### 4.2 Model Performance Monitoring
+- Track prediction accuracy over time
+- Detect model degradation
+- Trigger retraining alerts
+
+### 4.3 Automated Retraining
+- Weekly scheduled retraining pipeline
+- Triggered retraining on performance degradation
+- Automatic model promotion based on validation metrics
+
+---
+
+## Implementation Files
+
+### Key Code Files:
+
+#### 1. **config/gcp_config.py** - GCP Configuration
+```python
+# Centralized GCP project, bucket, and service configuration
+PROJECT_ID = "sysco-mlops-project"
+REGION = "us-central1"
+GCS_BUCKET = "sysco-forecasting-bucket"
+BIGQUERY_DATASET = "supply_chain_forecasting"
+VERTEX_AI_ENDPOINT_NAME = "sysco-forecasting-endpoint"
+```
+
+#### 2. **src/data/feature_engineering.py** - Feature Creation
+```python
+# Create lag features, rolling statistics, seasonal indicators
+# Input: raw demand data from BigQuery
+# Output: feature-engineered dataset for model training
+```
+
+#### 3. **src/models/ensemble_model.py** - Ensemble Forecasting
+```python
+# Combines LSTM, Prophet, and XGBoost
+# Weighted ensemble for robust predictions
+# Handles multiple SKUs and distribution centers
+```
+
+#### 4. **src/training/train_pipeline.py** - Training Orchestration
+```python
+# Vertex AI Pipeline using Kubeflow
+# Steps: data loading → validation → training → evaluation → deployment
+```
+
+#### 5. **src/orchestration/vertex_pipeline.py** - Pipeline Scheduling
+```python
+# Kubeflow V2 pipeline for Vertex AI
+# Schedules weekly retraining and monitoring
+```
+
+#### 6. **src/deployment/prediction_service.py** - Inference Service
+```python
+# Flask/FastAPI service deployed on Cloud Run
+# Handles batch and real-time predictions
+# Integrates with Vertex AI Endpoint
+```
+
+#### 7. **src/monitoring/data_drift_detector.py** - Drift Detection
+```python
+# Monitors feature distributions
+# Triggers alerts and retraining on significant drift
+```
+
+---
+
+## Deployment Steps
+
+### Step 1: GCP Setup
+```bash
+# Set project
+gcloud config set project sysco-mlops-project
+
+# Create BigQuery dataset
+bq mk --dataset supply_chain_forecasting
+
+# Create GCS bucket
+gsutil mb gs://sysco-forecasting-bucket
+
+# Enable APIs
+gcloud services enable \
+    bigquery.googleapis.com \
+    dataflow.googleapis.com \
+    aiplatform.googleapis.com \
+    cloudrun.googleapis.com \
+    cloudbuild.googleapis.com
+```
+
+### Step 2: Deploy Infrastructure (Terraform)
+```bash
+cd terraform/
+terraform plan
+terraform apply
+```
+
+### Step 3: Prepare Data
+```bash
+# Load raw data to BigQuery
+bq load --source_format=CSV \
+    supply_chain_forecasting.raw_demand \
+    gs://sysco-forecasting-bucket/data/*.csv
+
+# Run Dataflow ETL pipeline
+python src/data/data_loader.py
+```
+
+### Step 4: Train Model
+```bash
+# Local training
+python src/training/train_pipeline.py --mode=local
+
+# Vertex AI training
+python src/training/train_pipeline.py --mode=vertex-ai
+```
+
+### Step 5: Deploy Model
+```bash
+# Deploy to Vertex AI Endpoint
+python src/deployment/model_serving.py --action=deploy
+
+# Deploy inference service on Cloud Run
+gcloud run deploy sysco-forecasting-service \
+    --source . \
+    --platform managed \
+    --region us-central1
+```
+
+### Step 6: Setup Monitoring
+```bash
+python src/monitoring/model_performance_monitor.py --setup=true
+```
+
+---
+
+## CI/CD Pipelines
+
+### GitHub Actions Workflows:
+
+**1. CI Pipeline (.github/workflows/ci-pipeline.yml)**
+- Run tests on every PR
+- Data validation checks
+- Model performance benchmarks
+
+**2. Deploy Pipeline (.github/workflows/deploy-model.yml)**
+- Build Docker images
+- Push to Artifact Registry
+- Deploy to Vertex AI on main branch merge
+
+**3. Retraining Scheduler (.github/workflows/retraining-scheduler.yml)**
+- Trigger weekly retraining
+- Update production model if validation passes
+- Send performance reports
+
+---
+
+## Testing Strategy
+
+### Unit Tests
+- Data loader, validator, feature engineering
+- Model inference, prediction formatting
+
+### Integration Tests
+- End-to-end pipeline execution
+- BigQuery→Dataflow→Vertex AI flow
+- Prediction API response validation
+
+### Performance Tests
+- Model accuracy on holdout test set
+- Inference latency < 100ms
+- Throughput: 1000 predictions/sec
+
+---
+
+## Monitoring & Alerting
+
+### Metrics Tracked
+- Prediction accuracy (MAE, RMSE, MAPE)
+- Feature drift detection
+- Model latency and throughput
+- Data quality scores
+
+### Alerts
+- Model accuracy drops > 15%
+- Data drift detected
+- Pipeline failures
+- Endpoint errors
+
+---
+
+## Environment Configuration
+
+### Development
+```yaml
+# config/development.yaml
+GCP_REGION: us-central1
+BATCH_SIZE: 32
+EPOCHS: 50
+MODEL_TYPE: ensemble
+MONITORING_ENABLED: false
+```
+
+### Production
+```yaml
+# config/production.yaml
+GCP_REGION: us-central1
+BATCH_SIZE: 128
+EPOCHS: 100
+MODEL_TYPE: ensemble
+MONITORING_ENABLED: true
+AUTO_RETRAINING: true
+RETRAINING_FREQUENCY: weekly
+```
+
+---
+
+## Expected Outcomes
+
+✅ **20-50% reduction** in forecasting errors
+✅ **Optimized inventory** levels across distribution centers
+✅ **Reduced stockouts** by 15-20%
+✅ **Automated retraining** pipeline
+✅ **Real-time monitoring** dashboards
+✅ **Scalable architecture** supporting 10M+ SKUs
+
+---
+
+## Getting Started
+
+```bash
+# Clone repository
+git clone https://github.com/sysco/supply-chain-forecasting.git
+cd supply-chain-forecasting
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Setup GCP
+bash scripts/setup_project.sh
+
+# Run local tests
+pytest tests/
+
+# Train model
+python src/training/train_pipeline.py
+
+# Deploy
+bash scripts/deploy_model.sh
+```
+
+---
+
+## Team & Responsibilities
+
+- **Data Engineer:** BigQuery ETL, Dataflow pipelines
+- **ML Engineer:** Model development, feature engineering
+- **MLOps Engineer:** Pipeline orchestration, deployment, monitoring
+- **DevOps:** Infrastructure (Terraform), CI/CD, GCP management
+
+---
+
+## References & Documentation
+
+- [Vertex AI Documentation](https://cloud.google.com/vertex-ai/docs)
+- [Kubeflow Pipelines](https://www.kubeflow.org/docs/pipelines/)
+- [Supply Chain Forecasting Best Practices](https://cloud.google.com/solutions/demand-forecasting)
